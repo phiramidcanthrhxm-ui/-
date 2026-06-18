@@ -1,0 +1,1818 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8// ไฟล์ รหัส.gs (Google Apps Script) สำหรับระบบหมากรุก หมา VS แมว ออนไลน์
+// ทำหน้าที่เป็น API เชื่อมต่อกับระบบฐานข้อมูล Google Sheets
+
+function doGet(e) {
+  var action = e.parameter.action;
+  
+  if (action === "getLeaderboard") {
+    return handleGetLeaderboard();
+  } else if (action === "getLobbies") {
+    return handleGetLobbies();
+  } else if (action === "getLobbyState") {
+    return handleGetLobbyState(e.parameter.roomId);
+  }
+  
+  return jsonResponse({ success: false, message: "Action not found" });
+}
+
+function doPost(e) {
+  var data;
+  try {
+    data = JSON.parse(e.postData.contents);
+  } catch (err) {
+    return jsonResponse({ success: false, message: "Invalid JSON" });
+  }
+  
+  var action = data.action;
+  
+  if (action === "saveScore") {
+    return handleSaveScore(data.username, data.result);
+  } else if (action === "createLobby") {
+    return handleCreateLobby(data.roomName, data.player1, data.side);
+  } else if (action === "joinLobby") {
+    return handleJoinLobby(data.roomId, data.player2);
+  } else if (action === "updateLobby") {
+    return handleUpdateLobby(data.roomId, data.boardState, data.turn, data.gameOver);
+  } else if (action === "leaveLobby") {
+    return handleLeaveLobby(data.roomId, data.username);
+  }
+  
+  return jsonResponse({ success: false, message: "Post action not found" });
+}
+
+function jsonResponse(data) {
+  return ContentService.createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// === จัดการคะแนน (Leaderboard) ===
+function handleGetLeaderboard() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Leaderboard");
+  if (!sheet) return jsonResponse([]);
+  
+  var data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return jsonResponse([]);
+  
+  var rows = data.slice(1);
+  var leaderboard = rows.map(function(row) {
+    return {
+      username: row[0],
+      wins: Number(row[1]) || 0,
+      losses: Number(row[2]) || 0,
+      score: (Number(row[1]) || 0) * 10 - (Number(row[2]) || 0) * 5
+    };
+  });
+  
+  leaderboard.sort(function(a, b) {
+    return b.score - a.score;
+  });
+  
+  return jsonResponse(leaderboard.slice(0, 10));
+}
+
+function handleSaveScore(username, result) {
+  if (!username) return jsonResponse({ success: false, message: "Username required" });
+  
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Leaderboard");
+  if (!sheet) {
+    sheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("Leaderboard");
+    sheet.appendRow(["Username", "Wins", "Losses"]);
+  }
+  
+  var data = sheet.getDataRange().getValues();
+  var userRowIndex = -1;
+  
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0].toString().toLowerCase() === username.toLowerCase()) {
+      userRowIndex = i + 1;
+      break;
+    }
+  }
+  
+  if (userRowIndex === -1) {
+    var isWin = result === "win" ? 1 : 0;
+    var isLose = result === "lose" ? 1 : 0;
+    sheet.appendRow([username, isWin, isLose]);
+  } else {
+    var winsCol = 2;
+    var lossesCol = 3;
+    var currentWins = Number(sheet.getRange(userRowIndex, winsCol).getValue()) || 0;
+    var currentLosses = Number(sheet.getRange(userRowIndex, lossesCol).getValue()) || 0;
+    
+    if (result === "win") {
+      sheet.getRange(userRowIndex, winsCol).setValue(currentWins + 1);
+    } else if (result === "lose") {
+      sheet.getRange(userRowIndex, lossesCol).setValue(currentLosses + 1);
+    }
+  }
+  
+  return jsonResponse({ success: true, message: "Score updated successfully" });
+}
+
+// === จัดการห้องเล่น (Lobby System) ===
+function getLobbySheet() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Lobby");
+  if (!sheet) {
+    sheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("Lobby");
+    sheet.appendRow(["RoomId", "RoomName", "Player1", "P1Side", "Player2", "BoardState", "Turn", "GameOver", "LastActive"]);
+  }
+  return sheet;
+}
+
+function handleGetLobbies() {
+  var sheet = getLobbySheet();
+  var data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return jsonResponse([]);
+  
+  var now = new Date().getTime();
+  var lobbies = [];
+  
+  for (var i = 1; i < data.length; i++) {
+    var lastActive = new Date(data[i][8]).getTime();
+    if (now - lastActive > 15 * 60 * 1000) {
+      continue; 
+    }
+    
+    if (!data[i][4]) {
+      lobbies.push({
+        roomId: data[i][0],
+        roomName: data[i][1],
+        player1: data[i][2],
+        p1Side: data[i][3]
+      });
+    }
+  }
+  return jsonResponse(lobbies);
+}
+
+function handleCreateLobby(roomName, player1, side) {
+  var sheet = getLobbySheet();
+  var roomId = "room_" + new Date().getTime() + "_" + Math.floor(Math.random() * 1000);
+  var now = new Date();
+  
+  sheet.appendRow([
+    roomId,
+    roomName || "ห้องใหม่",
+    player1,
+    side,
+    "",
+    "",
+    "dog",
+    "false",
+    now
+  ]);
+  
+  return jsonResponse({ success: true, roomId: roomId });
+}
+
+function handleJoinLobby(roomId, player2) {
+  var sheet = getLobbySheet();
+  var data = sheet.getDataRange().getValues();
+  
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === roomId) {
+      if (data[i][4]) {
+        return jsonResponse({ success: false, message: "ห้องนี้เต็มแล้ว" });
+      }
+      var rowIndex = i + 1;
+      sheet.getRange(rowIndex, 5).setValue(player2);
+      sheet.getRange(rowIndex, 9).setValue(new Date());
+      
+      return jsonResponse({ 
+        success: true, 
+        roomId: roomId, 
+        p1Side: data[i][3], 
+        player1: data[i][2] 
+      });
+    }
+  }
+  return jsonResponse({ success: false, message: "ไม่พบห้องเล่น" });
+}
+
+function handleGetLobbyState(roomId) {
+  var sheet = getLobbySheet();
+  var data = sheet.getDataRange().getValues();
+  
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === roomId) {
+      var rowIndex = i + 1;
+      sheet.getRange(rowIndex, 9).setValue(new Date());
+      return jsonResponse({
+        success: true,
+        roomId: data[i][0],
+        roomName: data[i][1],
+        player1: data[i][2],
+        p1Side: data[i][3],
+        player2: data[i][4],
+        boardState: data[i][5],
+        turn: data[i][6],
+        gameOver: data[i][7] === "true" || data[i][7] === true
+      });
+    }
+  }
+  return jsonResponse({ success: false, message: "ไม่พบห้อง" });
+}
+
+function handleUpdateLobby(roomId, boardState, turn, gameOver) {
+  var sheet = getLobbySheet();
+  var data = sheet.getDataRange().getValues();
+  
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === roomId) {
+      var rowIndex = i + 1;
+      sheet.getRange(rowIndex, 6).setValue(boardState);
+      sheet.getRange(rowIndex, 7).setValue(turn);
+      sheet.getRange(rowIndex, 8).setValue(gameOver ? "true" : "false");
+      sheet.getRange(rowIndex, 9).setValue(new Date());
+      return jsonResponse({ success: true });
+    }
+  }
+  return jsonResponse({ success: false, message: "ไม่พบห้อง" });
+}
+
+function handleLeaveLobby(roomId, username) {
+  var sheet = getLobbySheet();
+  var data = sheet.getDataRange().getValues();
+  
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0] === roomId) {
+      var rowIndex = i + 1;
+      sheet.deleteRow(rowIndex);
+      return jsonResponse({ success: true, message: "ลบห้องและออกจากเกมแล้ว" });
+    }
+  }
+  return jsonResponse({ success: false, message: "ไม่พบห้อง" });
+}">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>เกมหมากรุก หมา VS แมว (Dogs vs Cats Chess)</title>
+  <!-- นำเข้า Tailwind CSS สำหรับการตกแต่งที่สวยงามและยืดหยุ่น -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- นำเข้า Chess.js เวอร์ชันเสถียรเพื่อควบคุมกติกาหมากรุกสากลแบบดั้งเดิม 100% -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+  <!-- ไอคอน FontAwesome สำหรับปุ่มและการตกแต่งเพิ่มเติม -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <!-- ฟอนต์ภาษาไทยและอังกฤษแนวเกมน่ารักพาสเทล -->
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@300;400;600;700&family=Fredoka+One&display=swap" rel="stylesheet">
+  
+  <style>
+    body {
+      font-family: 'Chakra Petch', sans-serif;
+      background: radial-gradient(circle, #fef6e4 0%, #f3e5f5 100%);
+    }
+    .fancy-title {
+      font-family: 'Fredoka One', 'Chakra Petch', sans-serif;
+    }
+    /* โครงสร้างตารางกระดานหมากรุก 8x8 */
+    .board-grid {
+      display: grid;
+      grid-template-columns: repeat(8, minmax(0, 1fr));
+      grid-template-rows: repeat(8, minmax(0, 1fr));
+      aspect-ratio: 1 / 1;
+    }
+    /* สีของช่องสว่างและช่องเข้มบนกระดานไม้พาสเทล */
+    .tile-light {
+      background-color: #f0eae1;
+    }
+    .tile-dark {
+      background-color: #8c6a5c;
+    }
+    /* แสดงจุดวงกลมสีม่วงเมื่อมีช่องที่สามารถเลือกเดินไปได้ */
+    .tile-highlight {
+      position: relative;
+    }
+    .tile-highlight::after {
+      content: '';
+      position: absolute;
+      width: 30%;
+      height: 30%;
+      background: rgba(124, 58, 237, 0.6);
+      border-radius: 50%;
+      top: 35%;
+      left: 35%;
+      pointer-events: none;
+    }
+    /* ขอบสีแดงเมื่อเป็นช่องที่เดินไปจับกินตัวหมากฝ่ายตรงข้ามได้ */
+    .tile-capture-highlight::after {
+      content: '';
+      position: absolute;
+      width: 80%;
+      height: 80%;
+      border: 4px solid rgba(239, 68, 68, 0.8);
+      border-radius: 50%;
+      top: 10%;
+      left: 10%;
+      pointer-events: none;
+    }
+    /* เน้นพื้นหลังสีเขียวตองอ่อนเมื่อเลือกตัวหมากตัวนั้น */
+    .tile-selected {
+      background-color: #d9f99d !important;
+    }
+    /* สีพื้นหลังสีแดงกระพริบเบาๆ เมื่อคิง (ราชา) โดนรุกฆาต */
+    .tile-check {
+      background-color: #fca5a5 !important;
+      animation: pulse-red 1.5s infinite;
+    }
+    @keyframes pulse-red {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.8; }
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col justify-between">
+
+  <!-- ส่วนหัวเว็บและเครื่องมือกรอกลิงก์ฐานข้อมูล Google Sheets -->
+  <header class="bg-white/80 backdrop-blur shadow-md py-4 px-6 border-b border-purple-100">
+    <div class="max-w-6xl mx-auto flex flex-col sm:flex-row justify-between items-center gap-4">
+      <div class="flex items-center gap-3">
+        <span class="text-4xl">🐶</span>
+        <h1 class="text-3xl font-bold fancy-title text-transparent bg-clip-text bg-gradient-to-r from-amber-600 to-purple-600">
+          Dogs vs Cats Chess
+        </h1>
+        <span class="text-4xl">🐱</span>
+      </div>
+      <!-- ช่องสำหรับเชื่อมต่อ Google Sheets Web App API -->
+      <div class="flex items-center gap-2 bg-purple-50 p-2 rounded-xl border border-purple-100 w-full sm:w-auto">
+        <i class="fa-solid fa-cloud text-purple-500 text-sm"></i>
+        <input id="api-url-input" type="text" placeholder="วางลิงก์ Web App (Google Sheets URL) ที่นี่" 
+          class="bg-transparent text-xs outline-none w-full sm:w-64 text-purple-900 font-sans" />
+        <button onclick="saveApiUrl()" class="bg-purple-600 hover:bg-purple-700 text-white text-xs px-3 py-1.5 rounded-lg transition font-semibold">
+          เชื่อมต่อคลาวด์
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- หน้าจอทำงานหลัก -->
+  <main class="flex-grow max-w-6xl w-full mx-auto p-4 md:p-6">
+    
+    <!-- 1. หน้าเมนูหลัก (Main Menu Screen) -->
+    <section id="menu-screen" class="grid grid-cols-1 lg:grid-cols-3 gap-6 my-auto pt-4">
+      
+      <!-- ฝั่งซ้าย: แนะนำตัวละครน่ารัก หมา vs แมว -->
+      <div class="bg-white/90 p-6 rounded-3xl shadow-xl border border-amber-100 flex flex-col justify-between">
+        <div>
+          <span class="bg-amber-100 text-amber-800 text-xs px-3 py-1 rounded-full font-bold">แนะนำตัวละคร</span>
+          <h2 class="text-2xl font-bold mt-3 mb-4 text-amber-900">อุ้งเท้าแห่งโชคชะตา!</h2>
+          <p class="text-gray-600 leading-relaxed mb-4 text-sm">
+            ความขัดแย้งแสนน่ารักระหว่าง <strong class="text-amber-600">ฝ่ายสุนัข (สีขาว)</strong> และ <strong class="text-purple-600">ฝ่ายแมว (สีดำ)</strong> บนกระดานหมากรุกสากลขนาด 8x8 ช่อง
+          </p>
+          <div class="space-y-3 text-sm text-gray-600">
+            <div class="flex items-center gap-3 p-1.5 bg-amber-50/50 rounded-lg">
+              <span class="text-2xl">🐕</span> 
+              <div>
+                <strong>เบี้ย (Pawn) : ลูกหมา / ลูกแมว</strong>
+                <p class="text-[11px] text-gray-500">เดินหน้าตรง 1-2 ช่อง กินแนวทะแยง</p>
+              </div>
+            </div>
+            <div class="flex items-center gap-3 p-1.5 bg-amber-50/50 rounded-lg">
+              <span class="text-2xl">🏰</span> 
+              <div>
+                <strong>รุค (Rook) : บ้านหมาบ็อก / กล่องกระดาษแมว</strong>
+                <p class="text-[11px] text-gray-500">เดินเป็นเส้นตรงแนวตั้งและแนวนอนไม่จำกัด</p>
+              </div>
+            </div>
+            <div class="flex items-center gap-3 p-1.5 bg-amber-50/50 rounded-lg">
+              <span class="text-2xl">🐎</span> 
+              <div>
+                <strong>ไนท์ (Knight) : ชิบะซิ่ง / แมวดำนักล่า</strong>
+                <p class="text-[11px] text-gray-500">เดินเป็นรูปตัว L สามารถกระโดดข้ามตัวอื่นได้</p>
+              </div>
+            </div>
+            <div class="flex items-center gap-3 p-1.5 bg-amber-50/50 rounded-lg">
+              <span class="text-2xl">📐</span> 
+              <div>
+                <strong>บิชอป (Bishop) : ปั๊กหลวงตา / วิเชียรมาศสวดมนต์</strong>
+                <p class="text-[11px] text-gray-500">เดินแนวทะแยงมุมสี่ทิศทางไม่จำกัดช่อง</p>
+              </div>
+            </div>
+            <div class="flex items-center gap-3 p-1.5 bg-amber-50/50 rounded-lg">
+              <span class="text-2xl">👑</span> 
+              <div>
+                <strong>ราชินี (Queen) : พูเดิ้ลไฮโซ / เปอร์เซียสวยหรู</strong>
+                <p class="text-[11px] text-gray-500">เดินแนวตรงและทะแยงมุมได้ทุกทิศทางอย่างอิสระ</p>
+              </div>
+            </div>
+            <div class="flex items-center gap-3 p-1.5 bg-amber-50/50 rounded-lg">
+              <span class="text-2xl">🤴</span> 
+              <div>
+                <strong>ราชา (King) : ไซบีเรียนจอมมึน / สิงโตส้มเจ้าป่า</strong>
+                <p class="text-[11px] text-gray-500">หัวหน้าฝูง เดินได้รอบตัว 1 ช่อง (ต้องปกป้องชีวิต!)</p>
+              </div>
+            </div>
+          </div>
+        </div>
+        <button onclick="openRulesModal()" class="mt-4 bg-amber-100 hover:bg-amber-200 text-amber-900 font-bold py-2.5 px-4 rounded-xl text-xs transition">
+          <i class="fa-solid fa-book-open mr-1"></i> อ่านกติกาการเล่นแบบละเอียด
+        </button>
+      </div>
+
+      <!-- ส่วนกลาง: การกรอกชื่อและการเลือกโหมดเกม -->
+      <div class="bg-white/90 p-8 rounded-3xl shadow-xl border border-purple-100 flex flex-col justify-center gap-5">
+        <h3 class="text-xl font-bold text-center text-purple-950 mb-2 fancy-title">เข้าสู่สมรภูมิ</h3>
+        
+        <!-- ส่วนกรอกชื่อผู้เล่นสำหรับส่งข้อมูลขึ้นคลาวด์ Sheets -->
+        <div class="mb-2">
+          <label class="block text-sm font-semibold text-gray-700 mb-1.5">ชื่อผู้เล่น (อังกฤษเท่านั้นเพื่อใช้จัดอันดับ)</label>
+          <div class="relative">
+            <span class="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400">👤</span>
+            <input type="text" id="username-input" placeholder="กรอกชื่อของคุณที่นี่..." 
+              class="w-full pl-10 pr-4 py-3 rounded-2xl border border-gray-200 outline-none focus:ring-2 focus:ring-purple-400 transition" />
+          </div>
+        </div>
+
+        <button onclick="startLocalGame()" class="w-full bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-white font-bold py-4 px-6 rounded-2xl shadow-lg hover:shadow-xl transition transform hover:-translate-y-0.5 flex justify-between items-center">
+          <span><i class="fa-solid fa-user-friends mr-2"></i> เล่นสองคนในหน้าจอนี้ (Local)</span>
+          <i class="fa-solid fa-chevron-right"></i>
+        </button>
+
+        <button onclick="openAiSettings()" class="w-full bg-gradient-to-r from-blue-500 to-cyan-600 hover:from-blue-600 hover:to-cyan-700 text-white font-bold py-4 px-6 rounded-2xl shadow-lg hover:shadow-xl transition transform hover:-translate-y-0.5 flex justify-between items-center">
+          <span><i class="fa-solid fa-robot mr-2"></i> เล่นแข่งกับสมองกล AI</span>
+          <i class="fa-solid fa-chevron-right"></i>
+        </button>
+
+        <button onclick="openOnlineLobby()" class="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white font-bold py-4 px-6 rounded-2xl shadow-lg hover:shadow-xl transition transform hover:-translate-y-0.5 flex justify-between items-center">
+          <span><i class="fa-solid fa-globe mr-2"></i> เล่นออนไลน์กับผู้เล่นอื่น</span>
+          <i class="fa-solid fa-chevron-right"></i>
+        </button>
+      </div>
+
+      <!-- ฝั่งขวา: ตารางอันดับคะแนน Leaderboard -->
+      <div class="bg-white/90 p-6 rounded-3xl shadow-xl border border-pink-100 flex flex-col">
+        <h3 class="text-xl font-bold mb-4 text-pink-900 flex items-center justify-between">
+          <span><i class="fa-solid fa-crown text-yellow-500 mr-1"></i> 10 อันดับอุ้งเท้าทองคำ</span>
+          <button onclick="fetchLeaderboard()" class="text-xs text-purple-600 hover:underline"><i class="fa-solid fa-rotate-right"></i> รีเฟรช</button>
+        </h3>
+        <div class="overflow-y-auto max-h-[350px] flex-grow pr-1">
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="text-gray-500 border-b border-gray-100 text-left">
+                <th class="pb-2">อันดับ</th>
+                <th class="pb-2">ชื่อผู้เล่น</th>
+                <th class="pb-2 text-center">ชนะ/แพ้</th>
+                <th class="pb-2 text-right">คะแนน</th>
+              </tr>
+            </thead>
+            <tbody id="leaderboard-body">
+              <tr>
+                <td colspan="4" class="text-center py-8 text-gray-400 text-xs">กรุณาเชื่อมต่อ Google Sheets API ทางขวาบนเพื่อดูข้อมูลอันดับ</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-[11px] text-gray-400 mt-3 text-center"><i class="fa-solid fa-star text-yellow-400"></i> ชนะได้ +10 คะแนน / แพ้หัก -5 คะแนน</p>
+      </div>
+    </section>
+
+    <!-- 2. หน้าจอตั้งค่าเล่นแข่งกับ AI (AI Settings Screen) -->
+    <section id="ai-screen" class="hidden max-w-md mx-auto bg-white/95 p-8 rounded-3xl shadow-2xl border border-blue-100 text-center">
+      <span class="text-5xl">🤖</span>
+      <h2 class="text-2xl font-bold text-blue-900 mt-4 mb-2">ปะทะสมองกลอัจฉริยะ</h2>
+      <p class="text-gray-500 text-sm mb-6">คุณจะสวมบทบาทเป็นฝั่งใดเพื่อโค่นบอทสมองกล?</p>
+      
+      <!-- การเลือกฝ่ายที่จะเล่น -->
+      <div class="mb-6">
+        <label class="block text-sm font-semibold text-gray-700 mb-2">เลือกฝ่ายของคุณ</label>
+        <div class="grid grid-cols-2 gap-4">
+          <button onclick="selectAiSide('dog')" id="ai-side-dog" class="border-2 border-amber-400 bg-amber-50 p-4 rounded-2xl flex flex-col items-center gap-1 transition">
+            <span class="text-4xl">🐶</span>
+            <span class="font-bold text-amber-900">สุนัข (เดินก่อน)</span>
+          </button>
+          <button onclick="selectAiSide('cat')" id="ai-side-cat" class="border-2 border-gray-200 hover:border-purple-300 p-4 rounded-2xl flex flex-col items-center gap-1 transition">
+            <span class="text-4xl">🐱</span>
+            <span class="font-bold text-purple-900">แมว (เดินหลัง)</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- เลือกระดับความฉลาดของการคำนวณ -->
+      <div class="mb-8">
+        <label class="block text-sm font-semibold text-gray-700 mb-2">ระดับความยากของบอท</label>
+        <div class="grid grid-cols-3 gap-2">
+          <button onclick="selectAiDifficulty(1)" id="ai-diff-1" class="py-2.5 rounded-xl font-bold border-2 border-emerald-500 bg-emerald-50 text-emerald-800 text-xs">ง่าย</button>
+          <button onclick="selectAiDifficulty(2)" id="ai-diff-2" class="py-2.5 rounded-xl font-bold border-2 border-gray-200 hover:border-amber-400 text-gray-600 text-xs">ปานกลาง</button>
+          <button onclick="selectAiDifficulty(3)" id="ai-diff-3" class="py-2.5 rounded-xl font-bold border-2 border-gray-200 hover:border-red-400 text-gray-600 text-xs">ยากที่สุด</button>
+        </div>
+      </div>
+
+      <div class="flex gap-3">
+        <button onclick="backToMenu()" class="w-1/2 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold py-3 px-4 rounded-xl transition">ย้อนกลับ</button>
+        <button onclick="startAiGame()" class="w-1/2 bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-700 hover:to-cyan-700 text-white font-bold py-3 px-4 rounded-xl shadow-md transition">เริ่มเล่นทันที</button>
+      </div>
+    </section>
+
+    <!-- 3. หน้าจอจัดการห้องและรอเล่นออนไลน์ (Online Lobby Screen) -->
+    <section id="lobby-screen" class="hidden bg-white/95 p-6 md:p-8 rounded-3xl shadow-xl border border-purple-100">
+      <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6">
+        <div>
+          <h2 class="text-2xl font-bold text-purple-950 flex items-center gap-2">
+            <span>🌐</span> ล็อบบี้การแข่งขันออนไลน์
+          </h2>
+          <p class="text-gray-500 text-sm">ค้นหาห้องว่างเพื่อเข้าร่วมเล่นแบบสลับตาเดิน หรือสร้างห้องว่างเพื่อรอผู้ท้าดวลคนถัดไป</p>
+        </div>
+        <div class="flex gap-2 w-full md:w-auto">
+          <button onclick="fetchLobbyRooms()" class="bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold px-4 py-2.5 rounded-xl transition flex items-center gap-2">
+            <i class="fa-solid fa-rotate-right"></i> รีเฟรชห้อง
+          </button>
+          <button onclick="openCreateRoomModal()" class="bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white font-bold px-4 py-2.5 rounded-xl shadow transition flex items-center gap-2">
+            <i class="fa-solid fa-plus"></i> สร้างห้องรอเล่น
+          </button>
+        </div>
+      </div>
+
+      <!-- รายการกระดานห้องรอผู้เล่นอื่น -->
+      <div class="border border-purple-100 rounded-2xl overflow-hidden bg-purple-50/20">
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-sm">
+            <thead class="bg-purple-100 text-purple-900 font-bold">
+              <tr>
+                <th class="p-4">ชื่อห้องเล่น</th>
+                <th class="p-4">เจ้าของห้อง</th>
+                <th class="p-4">ฝ่ายของเจ้าของ</th>
+                <th class="p-4">สถานะห้อง</th>
+                <th class="p-4 text-center">เข้าเล่น</th>
+              </tr>
+            </thead>
+            <tbody id="lobby-table-body" class="divide-y divide-purple-100">
+              <tr>
+                <td colspan="5" class="p-8 text-center text-gray-400">ยังไม่พบบอร์ดห้องว่างขณะนี้ ร่วมสร้างห้องแรกกันเถอะ!</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <button onclick="backToMenu()" class="mt-6 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold py-3 px-6 rounded-xl transition">
+        ย้อนกลับไปหน้าแรก
+      </button>
+    </section>
+
+    <!-- 4. หน้าจอเล่นเกมหลัก (Game Playing Screen) -->
+    <section id="game-screen" class="hidden grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+      <!-- บอร์ดข้อมูลฝั่งผู้เล่นและการควบคุมควบคุม (lg:col-span-4) -->
+      <div class="lg:col-span-4 space-y-4">
+        <!-- การ์ดฝั่งแมว (แมวดำ - ฝั่งบน) -->
+        <div class="bg-white p-4 rounded-3xl shadow-md border-2 border-purple-200 flex items-center justify-between relative overflow-hidden animate-fade-in" id="card-black-player">
+          <div class="absolute left-0 top-0 bottom-0 w-3 bg-purple-500"></div>
+          <div class="flex items-center gap-3 pl-2">
+            <div class="w-12 h-12 bg-purple-100 rounded-2xl flex items-center justify-center text-2xl">🐱</div>
+            <div>
+              <span class="text-xs font-bold text-purple-600 block">ฝ่ายแมว (ฝั่งดำ)</span>
+              <h4 class="font-bold text-gray-800 truncate w-36 md:w-44" id="player-black-name">กำลังประมวลผล...</h4>
+            </div>
+          </div>
+          <!-- พื้นที่เก็บตัวหมากหมาที่โดนกินโดยฝั่งแมว -->
+          <div class="flex flex-wrap gap-0.5 justify-end max-w-[120px]" id="captured-by-black"></div>
+        </div>
+
+        <!-- หน้าปัดรายงานสถานะของเทิร์นการเล่นปัจจุบัน -->
+        <div class="bg-white/90 p-5 rounded-3xl shadow-lg border border-purple-100 text-center">
+          <div id="game-status-label" class="bg-purple-100 text-purple-900 py-3 px-4 rounded-2xl text-lg font-bold mb-4 shadow-inner flex items-center justify-center gap-2">
+            <span>🐕</span> ตาใครเดินเอ่ย?
+          </div>
+
+          <!-- กล่องรายละเอียดข้อมูลออนไลน์พิเศษ -->
+          <div id="online-info-box" class="hidden mb-4 p-3 bg-indigo-50 border border-indigo-100 rounded-xl text-xs text-left space-y-1">
+            <div class="text-indigo-800 font-bold"><i class="fa-solid fa-signal mr-1 animate-pulse"></i> คุณกำลังเล่นเชื่อมต่อออนไลน์</div>
+            <div class="text-gray-600">ID ห้องอ้างอิง: <span id="game-room-id-label" class="font-mono">--</span></div>
+            <div class="text-gray-600">ทีมของคุณคือ: <span id="my-role-label" class="font-bold text-indigo-700">--</span></div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-2">
+            <button onclick="leaveCurrentGame()" class="bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 font-bold py-2.5 px-4 rounded-xl transition text-sm">
+              <i class="fa-solid fa-arrow-right-from-bracket mr-1"></i> ยอมแพ้ / ออก
+            </button>
+            <button onclick="resetLocalGame()" id="reset-game-btn" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 font-bold py-2.5 px-4 rounded-xl transition text-sm">
+              <i class="fa-solid fa-rotate-left mr-1"></i> เริ่มใหม่
+            </button>
+          </div>
+        </div>
+
+        <!-- การ์ดฝั่งหมา (ฝั่งล่าง) -->
+        <div class="bg-white p-4 rounded-3xl shadow-md border-2 border-amber-200 flex items-center justify-between relative overflow-hidden" id="card-white-player">
+          <div class="absolute left-0 top-0 bottom-0 w-3 bg-amber-500"></div>
+          <div class="flex items-center gap-3 pl-2">
+            <div class="w-12 h-12 bg-amber-100 rounded-2xl flex items-center justify-center text-2xl">🐶</div>
+            <div>
+              <span class="text-xs font-bold text-amber-600 block">ฝ่ายหมา (ฝั่งขาว)</span>
+              <h4 class="font-bold text-gray-800 truncate w-36 md:w-44" id="player-white-name">กำลังประมวลผล...</h4>
+            </div>
+          </div>
+          <!-- พื้นที่เก็บตัวหมากแมวที่โดนกินโดยฝั่งหมา -->
+          <div class="flex flex-wrap gap-0.5 justify-end max-w-[120px]" id="captured-by-white"></div>
+        </div>
+      </div>
+
+      <!-- พื้นที่สร้างกระดานหมากรุก (lg:col-span-8) -->
+      <div class="lg:col-span-8 flex justify-center items-center">
+        <div class="w-full max-w-2xl bg-amber-950 p-2 md:p-4 rounded-[2rem] shadow-2xl border-4 border-amber-900 relative">
+          <div id="chessboard" class="board-grid rounded-xl overflow-hidden select-none">
+            <!-- สร้างตารางอัตโนมัติด้วย JavaScript -->
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ฟุตเตอร์เครดิตด้านล่าง -->
+  <footer class="bg-amber-950 text-amber-200 text-xs py-3 text-center border-t border-amber-900">
+    <p>&copy; 2026 Dogs vs Cats Chess - สนุกสนานกับการโค่นล้มราชาหมาและแมว</p>
+  </footer>
+
+  <!-- ==================== รายการกล่องแสดงผลลัพธ์และป๊อปอัพ (MODALS) ==================== -->
+  
+  <!-- 1. ป๊อปอัพ "หน้ากติกาการเล่นแบบละเอียด" -->
+  <div id="rules-modal" class="fixed inset-0 bg-black/60 hidden justify-center items-center z-50 p-4">
+    <div class="bg-white w-full max-w-xl p-6 rounded-3xl shadow-2xl border border-amber-200 max-h-[85vh] flex flex-col justify-between animate-fade-in">
+      <div class="overflow-y-auto pr-2">
+        <div class="flex justify-between items-center mb-4">
+          <h3 class="text-xl font-bold text-amber-950 flex items-center gap-2">
+            <span>📖</span> กติกาการเล่น Dogs vs Cats Chess
+          </h3>
+          <button onclick="closeRulesModal()" class="text-gray-400 hover:text-gray-600 text-lg">&times;</button>
+        </div>
+        <div class="text-sm text-gray-600 space-y-4 leading-relaxed">
+          <p>
+            เกมนี้ใช้กฎกติกาการแข่งขันของ<strong>หมากรุกสากล (International Chess)</strong> ดั้งเดิม 100% โดยผู้เล่นสลับข้างเดินบนตารางขนาด 8x8 สลับสีกัน
+          </p>
+          <div class="bg-amber-50 p-3 rounded-2xl border border-amber-100">
+            <h4 class="font-bold text-amber-900 mb-1">กฎและกติกาเบื้องต้น:</h4>
+            <ul class="list-disc list-inside space-y-1 text-xs">
+              <li><strong>ฝ่ายสุนัข (สีขาว)</strong> จะเป็นฝ่ายที่ได้เดินหมากก่อนเสมอ</li>
+              <li>เป้าหมายสุดท้ายคือการจับกษัตริย์ของอีกฝ่ายให้เดินไปไหนไม่ได้อีก หรือที่เรียกว่า <strong>"รุกฆาต" (Checkmate)</strong></li>
+              <li><strong>รุก (Check):</strong> คือการที่ฝ่ายตรงข้ามเคลื่อนไหวตัวหมากมาเล็งโจมตีคิงโดยตรง คิงที่ถูกรุกต้องหลบหนีหรือป้องกันในตานั้นทันที</li>
+              <li><strong>เสมอ (Stalemate / Draw):</strong> เกิดขึ้นเมื่อผู้เล่นไม่สามารถขยับตัวหมากตัวใดๆ ได้เลยตามกติกา แต่คิงของเขาก็ไม่ได้อยู่ในสภาพโดนรุกด้วย</li>
+            </ul>
+          </div>
+          <div class="bg-purple-50 p-3 rounded-2xl border border-purple-100">
+            <h4 class="font-bold text-purple-900 mb-1">ความสามารถพิเศษระดับสากล:</h4>
+            <ul class="list-disc list-inside space-y-1 text-xs text-purple-900">
+              <li><strong>การเลื่อนขั้นเบี้ย (Pawn Promotion):</strong> เมื่อเบี้ยตัวจิ๋วของคุณเดินไปสุดกระดานของอีกฝั่ง จะได้รับการเลื่อนขั้นเป็น "ราชินี" (Queen) ทันที</li>
+              <li><strong>การเดินก้าวแรกของเบี้ย:</strong> เบี้ยที่ยังไม่เคยขยับ สามารถเลือกเดินตรงไปข้างหน้าได้ 2 ช่องในก้าวแรก</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <button onclick="closeRulesModal()" class="mt-4 bg-purple-600 hover:bg-purple-700 text-white font-bold py-2.5 rounded-xl transition text-sm w-full">
+        เข้าใจแล้ว เข้าสู่เกมกันเลย!
+      </button>
+    </div>
+  </div>
+
+  <!-- 2. ป๊อปอัพตั้งห้องออนไลน์ใหม่ -->
+  <div id="create-room-modal" class="fixed inset-0 bg-black/60 hidden justify-center items-center z-50 p-4">
+    <div class="bg-white w-full max-w-md p-6 rounded-3xl shadow-2xl border border-purple-100 transform scale-95 transition-all">
+      <h3 class="text-xl font-bold text-purple-950 mb-2 flex items-center gap-2">
+        <span>🆕</span> สร้างกระดานห้องออนไลน์
+      </h3>
+      <p class="text-gray-500 text-xs mb-4">ตั้งชื่อกระดานแล้วระบบจะรอรับข้อมูลแบบเรียลไทม์ผ่าน Google Sheets</p>
+      
+      <div class="space-y-4 mb-6">
+        <div>
+          <label class="block text-xs font-bold text-gray-700 mb-1">ตั้งชื่อห้องเล่น</label>
+          <input type="text" id="new-room-name-input" placeholder="ห้องแข่งแสนน่ารัก" 
+            class="w-full px-4 py-2.5 rounded-xl border border-gray-200 outline-none focus:ring-2 focus:ring-purple-400 transition text-sm" />
+        </div>
+        <div>
+          <label class="block text-xs font-bold text-gray-700 mb-1">เลือกฝ่ายที่ต้องการเล่น</label>
+          <div class="grid grid-cols-2 gap-2">
+            <button onclick="selectNewRoomSide('dog')" id="new-room-side-dog" class="py-2.5 rounded-xl border-2 border-amber-400 bg-amber-50 text-amber-900 font-bold text-xs flex justify-center items-center gap-1.5">
+              <span>🐶</span> ฝั่งหมา (ขาว)
+            </button>
+            <button onclick="selectNewRoomSide('cat')" id="new-room-side-cat" class="py-2.5 rounded-xl border-2 border-gray-100 hover:border-purple-300 text-gray-600 font-bold text-xs flex justify-center items-center gap-1.5">
+              <span>🐱</span> ฝั่งแมว (ดำ)
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex gap-2">
+        <button onclick="closeCreateRoomModal()" class="w-1/2 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold py-2.5 rounded-xl transition text-sm">ยกเลิก</button>
+        <button onclick="submitCreateRoom()" class="w-1/2 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white font-bold py-2.5 rounded-xl transition text-sm">ยืนยันสร้างห้อง</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. ป๊อปอัพจำลองการแจ้งเตือนอเนกประสงค์ (Alert) -->
+  <div id="alert-modal" class="fixed inset-0 bg-black/60 hidden justify-center items-center z-50 p-4">
+    <div class="bg-white w-full max-w-sm p-6 rounded-3xl shadow-2xl border border-amber-100 text-center animate-fade-in">
+      <div class="text-4xl mb-2" id="alert-icon">💡</div>
+      <h3 class="text-lg font-bold text-gray-800" id="alert-title">คำเตือน</h3>
+      <p class="text-gray-500 text-sm my-3 leading-relaxed" id="alert-message">ข้อความระบบ...</p>
+      <button onclick="closeAlertModal()" class="bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-6 rounded-xl transition text-sm">
+        รับทราบ
+      </button>
+    </div>
+  </div>
+
+  <!-- 4. ป๊อปอัพการสิ้นสุดเกม ชนะ/แพ้/เสมอ และบันทึกคะแนน -->
+  <div id="game-over-modal" class="fixed inset-0 bg-black/60 hidden justify-center items-center z-50 p-4">
+    <div class="bg-white w-full max-w-md p-6 rounded-3xl shadow-2xl border border-amber-100 text-center animate-fade-in">
+      <div class="text-5xl mb-2 animate-bounce" id="go-icon">🏆</div>
+      <h3 class="text-2xl font-bold text-gray-800" id="go-title">เช็กเมต จบเกม!</h3>
+      <p class="text-gray-500 text-sm my-4 leading-relaxed" id="go-message">รายละเอียดสถิติผลแพ้ชนะ</p>
+      
+      <!-- เมนูส่งคะแนนอัปเดตข้อมูลขึ้น Google Sheets -->
+      <div id="score-submit-box" class="hidden mb-6 p-4 bg-amber-50 rounded-2xl border border-amber-100 text-left">
+        <h4 class="text-xs font-bold text-amber-800 mb-1">ส่งสถิตินี้ไปยังฐานข้อมูลส่วนกลาง</h4>
+        <p class="text-gray-500 text-[10px] mb-2">ข้อมูลผู้แพ้และผู้ชนะจะถูกรวบรวมเพื่อคำนวณตำแหน่ง 10 ลำดับสูงสุดบนกระดานแชมป์</p>
+        <button onclick="submitResultToSheet()" id="submit-sheet-btn" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2 px-4 rounded-xl transition text-xs flex justify-center items-center gap-2">
+          <i class="fa-solid fa-cloud-arrow-up"></i> ยืนยันบันทึกผลการแข่งขัน
+        </button>
+      </div>
+
+      <div class="flex gap-2">
+        <button onclick="closeGameOverModal(); leaveCurrentGame();" class="w-1/2 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold py-2.5 rounded-xl transition text-sm">กลับเมนูหลัก</button>
+        <button onclick="retryCurrentGame()" id="go-retry-btn" class="w-1/2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-white font-bold py-2.5 rounded-xl shadow transition text-sm">เล่นอีกรอบ</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== ตรรกะกระดานหมากรุกและสมองกล AI ด้วย JavaScript ==================== -->
+  <script>
+    // --- ตัวแปรสากลเชื่อมต่อ API ---
+    let APPS_SCRIPT_URL = localStorage.getItem('chess_gas_url') || "";
+    let myUsername = localStorage.getItem('chess_username') || "";
+
+    // บรรจุค่าเริ่มต้นหากผู้ใช้เคยเข้ามาเล่นและเก็บ URL ไว้ในเครื่อง
+    document.getElementById('api-url-input').value = APPS_SCRIPT_URL;
+    document.getElementById('username-input').value = myUsername;
+
+    // ตัวแปรเก็บสถานะการเดินหมากของเกม
+    let chess = null; 
+    let gameMode = 'local'; // 'local', 'ai', 'online'
+    let selectedTileId = null; 
+    let currentTurn = 'w'; // 'w' = ฝั่งหมา (ขาว), 'b' = ฝั่งแมว (ดำ)
+    let aiDifficulty = 1; 
+    let mySide = 'dog'; 
+    let aiSide = 'cat'; 
+
+    // ข้อมูลระบบเชื่อมต่อแบบเรียลไทม์ออนไลน์
+    let onlineRoomId = null;
+    let onlinePoller = null;
+    let onlineRole = null; 
+    let lastKnownLobbyState = null;
+    let newRoomSideSelected = 'dog';
+
+    // SVG ตัวละครที่ถูกพัฒนาเป็นรูปสุนัขและแมวสุดน่ารัก (ฝั่งหมา = ขาว w / ฝั่งแมว = ดำ b)
+    const PIECE_SVGs = {
+      // === ฝั่งหมา (สีขาว - w) ===
+      'wP': `<svg viewBox="0 0 100 100" class="w-full h-full p-1 drop-shadow-md">
+        <circle cx="50" cy="50" r="42" fill="#fff" stroke="#f59e0b" stroke-width="4"/>
+        <path d="M42,40 C38,32 32,32 32,45 C32,50 36,52 40,50 C44,48 44,52 44,54" stroke="#78350f" stroke-width="3" fill="none" stroke-linecap="round"/>
+        <path d="M58,40 C62,32 68,32 68,45 C68,50 64,52 60,50 C56,48 56,52 56,54" stroke="#78350f" stroke-width="3" fill="none" stroke-linecap="round"/>
+        <ellipse cx="50" cy="56" rx="8" ry="5" fill="#78350f"/>
+        <circle cx="42" cy="46" r="3" fill="#3b2314"/>
+        <circle cx="58" cy="46" r="3" fill="#3b2314"/>
+        <path d="M47,62 Q50,65 53,62" stroke="#78350f" stroke-width="3" fill="none"/>
+        <path d="M48,63 Q50,72 52,63" fill="#f43f5e"/>
+        <rect x="35" y="74" width="30" height="6" rx="3" fill="#f59e0b"/>
+      </svg>`,
+      'wR': `<svg viewBox="0 0 100 100" class="w-full h-full p-1 drop-shadow-md">
+        <circle cx="50" cy="50" r="42" fill="#fff" stroke="#f59e0b" stroke-width="4"/>
+        <path d="M25,50 L50,25 L75,50 L68,50 L68,75 L32,75 L32,50 Z" fill="#fef3c7" stroke="#78350f" stroke-width="3"/>
+        <path d="M40,75 L40,55 A10,10 0 0,1 60,55 L60,75" fill="#78350f"/>
+        <circle cx="50" cy="40" r="4" fill="#f59e0b"/>
+        <path d="M48,64 Q50,61 52,64" stroke="#fff" stroke-width="2" fill="none"/>
+        <rect x="25" y="74" width="50" height="7" rx="2" fill="#f59e0b"/>
+      </svg>`,
+      'wN': `<svg viewBox="0 0 100 100" class="w-full h-full p-1 drop-shadow-md">
+        <circle cx="50" cy="50" r="42" fill="#fff" stroke="#f59e0b" stroke-width="4"/>
+        <path d="M30,30 L42,42 L32,55" fill="#f59e0b" stroke="#78350f" stroke-width="2"/>
+        <path d="M70,30 L58,42 L68,55" fill="#f59e0b" stroke="#78350f" stroke-width="2"/>
+        <path d="M30,45 C30,75 70,75 70,45 C70,30 30,30 30,45 Z" fill="#fbbf24" stroke="#78350f" stroke-width="3"/>
+        <ellipse cx="40" cy="45" rx="4" ry="6" fill="#fff"/>
+        <ellipse cx="60" cy="45" rx="4" ry="6" fill="#fff"/>
+        <circle cx="40" cy="46" r="2.5" fill="#000"/>
+        <circle cx="60" cy="46" r="2.5" fill="#000"/>
+        <ellipse cx="50" cy="54" rx="7" ry="4" fill="#78350f"/>
+        <rect x="28" y="74" width="44" height="6" rx="3" fill="#f59e0b"/>
+      </svg>`,
+      'wB': `<svg viewBox="0 0 100 100" class="w-full h-full p-1 drop-shadow-md">
+        <circle cx="50" cy="50" r="42" fill="#fff" stroke="#f59e0b" stroke-width="4"/>
+        <ellipse cx="50" cy="50" rx="24" ry="26" fill="#d97706" stroke="#78350f" stroke-width="3"/>
+        <path d="M28,34 C24,30 20,44 28,48 Z" fill="#451a03"/>
+        <path d="M72,34 C76,30 80,44 72,48 Z" fill="#451a03"/>
+        <ellipse cx="40" cy="48" rx="7" ry="9" fill="#451a03"/>
+        <ellipse cx="60" cy="48" rx="7" ry="9" fill="#451a03"/>
+        <circle cx="41" cy="48" r="3" fill="#fff"/>
+        <circle cx="59" cy="48" r="3" fill="#fff"/>
+        <ellipse cx="50" cy="58" rx="8" ry="6" fill="#1e1b4b"/>
+        <path d="M42,26 L50,14 L58,26 Z" fill="#f59e0b" stroke="#78350f" stroke-width="2"/>
+        <circle cx="50" cy="12" r="3" fill="#ef4444"/>
+        <rect x="30" y="74" width="40" height="6" rx="3" fill="#f59e0b"/>
+      </svg>`,
+      'wQ': `<svg viewBox="0 0 100 100" class="w-full h-full p-1 drop-shadow-md">
+        <circle cx="50" cy="50" r="42" fill="#fff" stroke="#f59e0b" stroke-width="4"/>
+        <path d="M30,52 C30,30 70,30 70,52 C70,72 30,72 30,52 Z" fill="#fef3c7" stroke="#78350f" stroke-width="3"/>
+        <circle cx="26" cy="48" r="12" fill="#fef3c7" stroke="#78350f" stroke-width="2"/>
+        <circle cx="74" cy="48" r="12" fill="#fef3c7" stroke="#78350f" stroke-width="2"/>
+        <ellipse cx="42" cy="50" rx="3" ry="4" fill="#000"/>
+        <ellipse cx="58" cy="50" rx="3" ry="4" fill="#000"/>
+        <circle cx="50" cy="56" r="4" fill="#f43f5e"/>
+        <path d="M34,30 L42,18 L50,28 L58,18 L66,30 Z" fill="#fbbf24" stroke="#78350f" stroke-width="2"/>
+        <circle cx="50" cy="18" r="3" fill="#7c3aed"/>
+        <rect x="25" y="74" width="50" height="7" rx="3" fill="#f59e0b"/>
+      </svg>`,
+      'wK': `<svg viewBox="0 0 100 100" class="w-full h-full p-1 drop-shadow-md">
+        <circle cx="50" cy="50" r="42" fill="#fff" stroke="#f59e0b" stroke-width="4"/>
+        <path d="M30,32 L40,16 L48,32" fill="#6b7280" stroke="#374151" stroke-width="2"/>
+        <path d="M70,32 L60,16 L52,32" fill="#6b7280" stroke="#374151" stroke-width="2"/>
+        <path d="M30,48 C30,72 70,72 70,48 C70,32 30,32 30,48 Z" fill="#e5e7eb" stroke="#374151" stroke-width="3"/>
+        <path d="M30,48 C30,36 50,32 50,48 C50,32 70,36 70,48 Z" fill="#6b7280"/>
+        <polygon points="40,46 44,46 42,50" fill="#2563eb"/>
+        <polygon points="60,46 56,46 58,50" fill="#2563eb"/>
+        <polygon points="47,56 53,56 50,61" fill="#000"/>
+        <path d="M38,20 L42,8 L50,16 L58,8 L62,20 Z" fill="#f59e0b" stroke="#78350f" stroke-width="2"/>
+        <line x1="50" y1="8" x2="50" y2="1" stroke="#ef4444" stroke-width="3" stroke-linecap="round"/>
+        <line x1="46" y1="4" x2="54" y2="4" stroke="#ef4444" stroke-width="3" stroke-linecap="round"/>
+        <rect x="25" y="74" width="50" height="7" rx="3" fill="#f59e0b"/>
+      </svg>`,
+
+      // === ฝั่งแมว (สีดำ - b) ===
+      'bP': `<svg viewBox="0 0 100 100" class="w-full h-full p-1 drop-shadow-md">
+        <circle cx="50" cy="50" r="42" fill="#fff" stroke="#8b5cf6" stroke-width="4"/>
+        <path d="M34,36 L32,24 L44,32" fill="#312e81" stroke="#312e81" stroke-width="2"/>
+        <path d="M66,36 L68,24 L56,32" fill="#312e81" stroke="#312e81" stroke-width="2"/>
+        <circle cx="50" cy="54" r="22" fill="#4c1d95"/>
+        <circle cx="42" cy="50" r="3.5" fill="#facc15"/>
+        <circle cx="58" cy="50" r="3.5" fill="#facc15"/>
+        <polygon points="48,56 52,56 50,59" fill="#f43f5e"/>
+        <line x1="28" y1="56" x2="16" y2="53" stroke="#4c1d95" stroke-width="2"/>
+        <line x1="28" y1="60" x2="14" y2="60" stroke="#4c1d95" stroke-width="2"/>
+        <line x1="72" y1="56" x2="84" y2="53" stroke="#4c1d95" stroke-width="2"/>
+        <line x1="72" y1="60" x2="86" y2="60" stroke="#4c1d95" stroke-width="2"/>
+        <rect x="35" y="74" width="30" height="6" rx="3" fill="#8b5cf6"/>
+      </svg>`,
+      'bR': `<svg viewBox="0 0 100 100" class="w-full h-full p-1 drop-shadow-md">
+        <circle cx="50" cy="50" r="42" fill="#fff" stroke="#8b5cf6" stroke-width="4"/>
+        <rect x="26" y="32" width="48" height="42" rx="4" fill="#a16207" stroke="#451a03" stroke-width="3"/>
+        <rect x="38" y="52" width="24" height="22" rx="2" fill="#451a03"/>
+        <line x1="26" y1="46" x2="74" y2="46" stroke="#451a03" stroke-width="2"/>
+        <ellipse cx="50" cy="38" rx="14" ry="10" fill="#1e1b4b"/>
+        <polygon points="40,32 38,22 46,28" fill="#1e1b4b"/>
+        <polygon points="60,32 62,22 54,28" fill="#1e1b4b"/>
+        <circle cx="45" cy="37" r="2" fill="#fff"/>
+        <circle cx="55" cy="37" r="2" fill="#fff"/>
+        <rect x="22" y="74" width="56" height="7" rx="2" fill="#8b5cf6"/>
+      </svg>`,
+      'bN': `<svg viewBox="0 0 100 100" class="w-full h-full p-1 drop-shadow-md">
+        <circle cx="50" cy="50" r="42" fill="#fff" stroke="#8b5cf6" stroke-width="4"/>
+        <path d="M30,30 L22,14 L36,24" fill="#1e1b4b" stroke="#1e1b4b" stroke-width="2"/>
+        <path d="M70,30 L78,14 L64,24" fill="#1e1b4b" stroke="#1e1b4b" stroke-width="2"/>
+        <path d="M30,46 C30,74 70,74 70,46 C70,30 30,30 30,46 Z" fill="#111827" stroke="#1e1b4b" stroke-width="3"/>
+        <ellipse cx="42" cy="44" rx="4.5" ry="6" fill="#22c55e"/>
+        <ellipse cx="58" cy="44" rx="4.5" ry="6" fill="#3b82f6"/>
+        <circle cx="42" cy="44" r="1.5" fill="#000"/>
+        <circle cx="58" cy="44" r="1.5" fill="#000"/>
+        <ellipse cx="50" cy="52" rx="4" ry="2.5" fill="#f43f5e"/>
+        <rect x="28" y="74" width="44" height="6" rx="3" fill="#8b5cf6"/>
+      </svg>`,
+      'bB': `<svg viewBox="0 0 100 100" class="w-full h-full p-1 drop-shadow-md">
+        <circle cx="50" cy="50" r="42" fill="#fff" stroke="#8b5cf6" stroke-width="4"/>
+        <ellipse cx="50" cy="50" rx="24" ry="26" fill="#e2e8f0" stroke="#475569" stroke-width="3"/>
+        <path d="M35,38 Q50,30 65,38 Q55,68 50,68 Q45,68 35,38 Z" fill="#334155"/>
+        <polygon points="32,32 26,18 40,28" fill="#334155"/>
+        <polygon points="68,32 74,18 60,28" fill="#334155"/>
+        <circle cx="43" cy="44" r="4" fill="#60a5fa"/>
+        <circle cx="57" cy="44" r="4" fill="#60a5fa"/>
+        <circle cx="43" cy="44" r="1.5" fill="#000"/>
+        <circle cx="57" cy="44" r="1.5" fill="#000"/>
+        <path d="M44,26 L56,26" stroke="#fbbf24" stroke-width="3"/>
+        <path d="M50,20 L50,32" stroke="#fbbf24" stroke-width="3"/>
+        <rect x="30" y="74" width="40" height="6" rx="3" fill="#8b5cf6"/>
+      </svg>`,
+      'bQ': `<svg viewBox="0 0 100 100" class="w-full h-full p-1 drop-shadow-md">
+        <circle cx="50" cy="50" r="42" fill="#fff" stroke="#8b5cf6" stroke-width="4"/>
+        <ellipse cx="50" cy="50" rx="25" ry="25" fill="#f8fafc" stroke="#64748b" stroke-width="3"/>
+        <circle cx="24" cy="50" r="11" fill="#f8fafc" stroke="#64748b" stroke-width="2"/>
+        <circle cx="76" cy="50" r="11" fill="#f8fafc" stroke="#64748b" stroke-width="2"/>
+        <polygon points="32,32 24,14 38,24" fill="#64748b"/>
+        <polygon points="68,32 76,14 62,24" fill="#64748b"/>
+        <ellipse cx="41" cy="46" rx="3.5" ry="5.5" fill="#a855f7"/>
+        <ellipse cx="59" cy="46" rx="3.5" ry="5.5" fill="#a855f7"/>
+        <path d="M34,30 L42,18 L50,28 L58,18 L66,30 Z" fill="#d946ef" stroke="#701a75" stroke-width="2"/>
+        <circle cx="50" cy="18" r="3" fill="#fbbf24"/>
+        <rect x="25" y="74" width="50" height="7" rx="3" fill="#8b5cf6"/>
+      </svg>`,
+      'bK': `<svg viewBox="0 0 100 100" class="w-full h-full p-1 drop-shadow-md">
+        <circle cx="50" cy="50" r="42" fill="#fff" stroke="#8b5cf6" stroke-width="4"/>
+        <path d="M22,50 C12,30 88,30 78,50 C88,70 12,70 22,50 Z" fill="#ea580c" stroke="#7c2d12" stroke-width="3"/>
+        <circle cx="50" cy="50" r="23" fill="#f97316"/>
+        <polygon points="34,34 26,18 42,28" fill="#ea580c"/>
+        <polygon points="66,34 74,18 58,28" fill="#ea580c"/>
+        <circle cx="42" cy="46" r="4" fill="#22c55e"/>
+        <circle cx="58" cy="46" r="4" fill="#22c55e"/>
+        <polygon points="46,54 54,54 50,58" fill="#000"/>
+        <path d="M38,20 L42,8 L50,16 L58,8 L62,20 Z" fill="#eab308" stroke="#854d0e" stroke-width="2"/>
+        <line x1="50" y1="8" x2="50" y2="1" stroke="#f43f5e" stroke-width="3" stroke-linecap="round"/>
+        <line x1="46" y1="4" x2="54" y2="4" stroke="#f43f5e" stroke-width="3" stroke-linecap="round"/>
+        <rect x="25" y="74" width="50" height="7" rx="3" fill="#8b5cf6"/>
+      </svg>`
+    };
+
+    // --- ตระกูลโมดอลแผงควบคุม ---
+    function openRulesModal() {
+      document.getElementById('rules-modal').classList.remove('hidden');
+    }
+
+    function closeRulesModal() {
+      document.getElementById('rules-modal').classList.add('hidden');
+    }
+
+    function openAlertModal(title, message, icon = "💡") {
+      document.getElementById('alert-icon').innerText = icon;
+      document.getElementById('alert-title').innerText = title;
+      document.getElementById('alert-message').innerText = message;
+      document.getElementById('alert-modal').classList.remove('hidden');
+    }
+
+    function closeAlertModal() {
+      document.getElementById('alert-modal').classList.add('hidden');
+    }
+
+    function openCreateRoomModal() {
+      document.getElementById('new-room-name-input').value = `${myUsername}'s Room`;
+      document.getElementById('create-room-modal').classList.remove('hidden');
+    }
+
+    function closeCreateRoomModal() {
+      document.getElementById('create-room-modal').classList.add('hidden');
+    }
+
+    function openGameOverModal(title, msg, icon) {
+      document.getElementById('go-icon').innerText = icon;
+      document.getElementById('go-title').innerText = title;
+      document.getElementById('go-message').innerText = msg;
+      document.getElementById('game-over-modal').classList.remove('hidden');
+    }
+
+    function closeGameOverModal() {
+      document.getElementById('game-over-modal').classList.add('hidden');
+    }
+
+    // --- บันทึกตัวเชื่อมคลาวด์ ---
+    function saveApiUrl() {
+      const val = document.getElementById('api-url-input').value.trim();
+      if (!val) {
+        openAlertModal("แจ้งเตือน", "กรุณาระบุ URL ของสคริปต์ Google Sheets ให้ถูกต้อง");
+        return;
+      }
+      APPS_SCRIPT_URL = val;
+      localStorage.setItem('chess_gas_url', val);
+      openAlertModal("เชื่อมต่อสำเร็จ", "ระบบจดจำลิงก์ Google Sheets Web App แล้ว!", "⚡");
+      fetchLeaderboard();
+    }
+
+    // --- จัดลำดับคะแนน (Leaderboard) ---
+    function fetchLeaderboard() {
+      if (!APPS_SCRIPT_URL) return;
+      
+      fetch(`${APPS_SCRIPT_URL}?action=getLeaderboard`)
+        .then(res => res.json())
+        .then(data => {
+          const tbody = document.getElementById('leaderboard-body');
+          if (!data || data.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="4" class="text-center py-8 text-gray-400 text-xs">ยังไม่พบบันทึกการชนะ ร่วมชนะเป็นคนแรกเลย!</td></tr>`;
+            return;
+          }
+          
+          tbody.innerHTML = "";
+          data.forEach((item, index) => {
+            const medal = index === 0 ? "🥇" : index === 1 ? "🥈" : index === 2 ? "🥉" : `${index + 1}`;
+            const medalClass = index < 3 ? "text-lg font-bold" : "text-gray-500";
+            tbody.innerHTML += `
+              <tr class="border-b border-gray-50 hover:bg-gray-50 transition">
+                <td class="py-2.5 pl-2 ${medalClass}">${medal}</td>
+                <td class="py-2.5 font-semibold text-gray-800">${escapeHtml(item.username)}</td>
+                <td class="py-2.5 text-center text-xs text-gray-500">${item.wins} / ${item.losses}</td>
+                <td class="py-2.5 text-right font-bold text-purple-700 pr-2">${item.score}</td>
+              </tr>
+            `;
+          });
+        })
+        .catch(err => {
+          console.error("Leaderboard error:", err);
+        });
+    }
+
+    function escapeHtml(text) {
+      if (!text) return "";
+      return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    // --- ควบคุมการนำทางเมนูหลัก ---
+    function backToMenu() {
+      stopOnlinePolling();
+      document.getElementById('menu-screen').classList.remove('hidden');
+      document.getElementById('ai-screen').classList.add('hidden');
+      document.getElementById('lobby-screen').classList.add('hidden');
+      document.getElementById('game-screen').classList.add('hidden');
+    }
+
+    function saveUsername() {
+      const u = document.getElementById('username-input').value.trim();
+      if (u) {
+        myUsername = u;
+        localStorage.setItem('chess_username', u);
+      } else {
+        myUsername = "Player_" + Math.floor(Math.random() * 1000);
+      }
+    }
+
+    // --- เล่นสองคน (Local) ---
+    function startLocalGame() {
+      saveUsername();
+      gameMode = 'local';
+      mySide = 'dog'; // ฝั่งสุนัขได้เดินก่อนตามกติกาสากล
+      initChessboardGame();
+    }
+
+    // --- แข่งกับบอท (AI) ---
+    function openAiSettings() {
+      saveUsername();
+      document.getElementById('menu-screen').classList.add('hidden');
+      document.getElementById('ai-screen').classList.remove('hidden');
+    }
+
+    function selectAiSide(side) {
+      mySide = side;
+      aiSide = side === 'dog' ? 'cat' : 'dog';
+      
+      document.getElementById('ai-side-dog').className = side === 'dog' 
+        ? "border-2 border-amber-400 bg-amber-50 p-4 rounded-2xl flex flex-col items-center gap-1 transition"
+        : "border-2 border-gray-200 hover:border-amber-300 p-4 rounded-2xl flex flex-col items-center gap-1 transition";
+        
+      document.getElementById('ai-side-cat').className = side === 'cat' 
+        ? "border-2 border-purple-400 bg-purple-50 p-4 rounded-2xl flex flex-col items-center gap-1 transition"
+        : "border-2 border-gray-200 hover:border-purple-300 p-4 rounded-2xl flex flex-col items-center gap-1 transition";
+    }
+
+    function selectAiDifficulty(level) {
+      aiDifficulty = level;
+      for (let i = 1; i <= 3; i++) {
+        const btn = document.getElementById(`ai-diff-${i}`);
+        if (i === level) {
+          btn.className = `py-2.5 rounded-xl font-bold border-2 ${
+            i === 1 ? 'border-emerald-500 bg-emerald-50 text-emerald-800' : 
+            i === 2 ? 'border-amber-400 bg-amber-50 text-amber-800' : 
+            'border-red-400 bg-red-50 text-red-800'
+          } text-xs`;
+        } else {
+          btn.className = "py-2.5 rounded-xl font-bold border-2 border-gray-200 hover:border-gray-400 text-gray-600 text-xs";
+        }
+      }
+    }
+
+    function startAiGame() {
+      gameMode = 'ai';
+      document.getElementById('ai-screen').classList.add('hidden');
+      initChessboardGame();
+    }
+
+    // --- ดวลคู่ออนไลน์ (Online Multiplay) ---
+    function openOnlineLobby() {
+      if (!APPS_SCRIPT_URL) {
+        openAlertModal("แจ้งเตือน", "กรุณาระบุและเชื่อมต่อคลาวด์ Google Sheets ที่แถบด้านบนของหน้าจอให้เสร็จสิ้นก่อนเริ่มเล่นออนไลน์ครับ");
+        return;
+      }
+      saveUsername();
+      document.getElementById('menu-screen').classList.add('hidden');
+      document.getElementById('lobby-screen').classList.remove('hidden');
+      fetchLobbyRooms();
+    }
+
+    function fetchLobbyRooms() {
+      const tbody = document.getElementById('lobby-table-body');
+      tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-purple-600 font-semibold"><i class="fa-solid fa-spinner animate-spin mr-2"></i>กำลังดึงข้อมูลห้องแข่งขันจากเซิร์ฟเวอร์...</td></tr>`;
+      
+      fetch(`${APPS_SCRIPT_URL}?action=getLobbies`)
+        .then(res => res.json())
+        .then(rooms => {
+          if (!rooms || rooms.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-gray-400 text-xs">ยังไม่พบห้องว่างสำหรับเล่นออนไลน์ในขณะนี้ ลองสร้างห้องคนแรกดูสิ!</td></tr>`;
+            return;
+          }
+          tbody.innerHTML = "";
+          rooms.forEach(room => {
+            const sideLabel = room.p1Side === 'dog' ? '🐶 หมา' : '🐱 แมว';
+            tbody.innerHTML += `
+              <tr class="hover:bg-purple-50 transition">
+                <td class="p-4 font-semibold text-gray-800">${escapeHtml(room.roomName)}</td>
+                <td class="p-4 text-gray-600">${escapeHtml(room.player1)}</td>
+                <td class="p-4 text-xs font-semibold">${sideLabel}</td>
+                <td class="p-4"><span class="bg-emerald-100 text-emerald-800 text-xs px-2.5 py-1 rounded-full font-bold">ว่างรอเล่น</span></td>
+                <td class="p-4 text-center">
+                  <button onclick="joinRoom('${room.roomId}')" class="bg-purple-600 hover:bg-purple-700 text-white text-xs px-4 py-2 rounded-xl font-bold transition">
+                    เข้าดวลคู่
+                  </button>
+                </td>
+              </tr>
+            `;
+          });
+        })
+        .catch(err => {
+          tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-red-500">การเชื่อมต่อผิดพลาด โปรดทดลองกดรีเฟรชใหม่อีกครั้ง</td></tr>`;
+        });
+    }
+
+    function selectNewRoomSide(side) {
+      newRoomSideSelected = side;
+      document.getElementById('new-room-side-dog').className = side === 'dog'
+        ? "py-2.5 rounded-xl border-2 border-amber-400 bg-amber-50 text-amber-900 font-bold text-xs flex justify-center items-center gap-1.5"
+        : "py-2.5 rounded-xl border-2 border-gray-100 hover:border-amber-300 text-gray-600 font-bold text-xs flex justify-center items-center gap-1.5";
+
+      document.getElementById('new-room-side-cat').className = side === 'cat'
+        ? "py-2.5 rounded-xl border-2 border-purple-400 bg-purple-50 text-purple-900 font-bold text-xs flex justify-center items-center gap-1.5"
+        : "py-2.5 rounded-xl border-2 border-gray-100 hover:border-purple-300 text-gray-600 font-bold text-xs flex justify-center items-center gap-1.5";
+    }
+
+    function submitCreateRoom() {
+      const roomName = document.getElementById('new-room-name-input').value.trim() || "ห้องหมากระเบิด";
+      closeCreateRoomModal();
+      
+      openAlertModal("สร้างห้อง", "กำลังตั้งห้องรอผู้เล่นอื่นบน Google Sheets...", "⏳");
+
+      const payload = {
+        action: "createLobby",
+        roomName: roomName,
+        player1: myUsername,
+        side: newRoomSideSelected
+      };
+
+      fetch(APPS_SCRIPT_URL, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      })
+      .then(res => res.json())
+      .then(res => {
+        closeAlertModal();
+        if (res.success) {
+          onlineRoomId = res.roomId;
+          mySide = newRoomSideSelected;
+          onlineRole = 'player1';
+          
+          document.getElementById('lobby-screen').classList.add('hidden');
+          initChessboardGame();
+          startOnlinePolling();
+        } else {
+          openAlertModal("ล้มเหลว", res.message || "สร้างห้องออนไลน์ไม่สำเร็จ");
+        }
+      })
+      .catch(err => {
+        closeAlertModal();
+        openAlertModal("ข้อผิดพลาดเครือข่าย", "การส่งข้อมูลตั้งบอร์ดจับคู่ขัดข้อง");
+      });
+    }
+
+    function joinRoom(roomId) {
+      openAlertModal("เชื่อมต่อห้อง", "กำลังลงทะเบียนเข้าดวลกระดานออนไลน์...", "⏳");
+      
+      const payload = {
+        action: "joinLobby",
+        roomId: roomId,
+        player2: myUsername
+      };
+
+      fetch(APPS_SCRIPT_URL, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      })
+      .then(res => res.json())
+      .then(res => {
+        closeAlertModal();
+        if (res.success) {
+          onlineRoomId = res.roomId;
+          mySide = res.p1Side === 'dog' ? 'cat' : 'dog';
+          onlineRole = 'player2';
+          
+          document.getElementById('lobby-screen').classList.add('hidden');
+          initChessboardGame();
+          startOnlinePolling();
+        } else {
+          openAlertModal("ล้มเหลว", res.message);
+        }
+      })
+      .catch(err => {
+        closeAlertModal();
+        openAlertModal("เกิดข้อผิดพลาด", "ไม่สามารถเชื่อมต่อห้องแข่งที่ต้องการได้");
+      });
+    }
+
+    // --- ระบบดึงความคืบหน้าแบบเรียลไทม์ (Polling System) ---
+    function startOnlinePolling() {
+      stopOnlinePolling();
+      pollLobbyState();
+      onlinePoller = setInterval(pollLobbyState, 2500);
+    }
+
+    function stopOnlinePolling() {
+      if (onlinePoller) {
+        clearInterval(onlinePoller);
+        onlinePoller = null;
+      }
+    }
+
+    function pollLobbyState() {
+      if (!onlineRoomId || !APPS_SCRIPT_URL) return;
+
+      fetch(`${APPS_SCRIPT_URL}?action=getLobbyState&roomId=${onlineRoomId}`)
+        .then(res => res.json())
+        .then(state => {
+          if (!state.success) {
+            openAlertModal("ห้องยุบแล้ว", "ฝ่ายตรงข้ามออกจากห้องหรือลบห้องการแข่งขัน");
+            leaveCurrentGame();
+            return;
+          }
+          
+          lastKnownLobbyState = state;
+          
+          const p1 = state.player1;
+          const p2 = state.player2;
+          
+          if (onlineRole === 'player1') {
+            document.getElementById('player-white-name').innerText = state.p1Side === 'dog' ? p1 : p2 || "รอผู้เล่นคนอื่นดวล...";
+            document.getElementById('player-black-name').innerText = state.p1Side === 'cat' ? p1 : p2 || "รอผู้เล่นคนอื่นดวล...";
+          } else {
+            document.getElementById('player-white-name').innerText = state.p1Side === 'dog' ? p1 : p2;
+            document.getElementById('player-black-name').innerText = state.p1Side === 'cat' ? p1 : p2;
+          }
+
+          if (state.boardState) {
+            const currentFen = chess.fen();
+            if (state.boardState !== currentFen) {
+              chess.load(state.boardState);
+              currentTurn = chess.turn();
+              renderBoard();
+              updateTurnLabel();
+              checkGameStatus();
+            }
+          }
+        })
+        .catch(err => console.error("ระบบคลาวด์ขัดข้อง: ", err));
+    }
+
+    function pushOnlineBoardState() {
+      if (gameMode !== 'online' || !onlineRoomId) return;
+
+      const payload = {
+        action: "updateLobby",
+        roomId: onlineRoomId,
+        boardState: chess.fen(),
+        turn: chess.turn() === 'w' ? 'dog' : 'cat',
+        gameOver: chess.game_over()
+      };
+
+      fetch(APPS_SCRIPT_URL, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      })
+      .then(res => res.json())
+      .then(data => {
+        if (!data.success) console.warn("การอัปเดตตาเดินออนไลน์ไม่เสร็จสมบูรณ์");
+      })
+      .catch(err => console.error("อัปเดตออนไลน์ผิดพลาด:", err));
+    }
+
+    // ==================== หมากรุกระบบควบคุมและกติกา ====================
+    
+    function initChessboardGame() {
+      document.getElementById('menu-screen').classList.add('hidden');
+      document.getElementById('game-screen').classList.remove('hidden');
+
+      if (gameMode === 'local') {
+        document.getElementById('player-white-name').innerText = `${myUsername} (หมา)`;
+        document.getElementById('player-black-name').innerText = "คู่ต่อสู้ (แมว)";
+        document.getElementById('online-info-box').classList.add('hidden');
+        document.getElementById('reset-game-btn').classList.remove('hidden');
+      } else if (gameMode === 'ai') {
+        document.getElementById('player-white-name').innerText = mySide === 'dog' ? `${myUsername} (คุณ)` : "บอทสมองกล AI";
+        document.getElementById('player-black-name').innerText = mySide === 'cat' ? `${myUsername} (คุณ)` : "บอทสมองกล AI";
+        document.getElementById('online-info-box').classList.add('hidden');
+        document.getElementById('reset-game-btn').classList.remove('hidden');
+      } else if (gameMode === 'online') {
+        document.getElementById('online-info-box').classList.remove('hidden');
+        document.getElementById('game-room-id-label').innerText = onlineRoomId;
+        document.getElementById('my-role-label').innerText = mySide === 'dog' ? "ฝ่ายหมา (สุนัข)" : "ฝ่ายแมว (แมว)";
+        document.getElementById('reset-game-btn').classList.add('hidden'); 
+      }
+
+      chess = new Chess();
+      selectedTileId = null;
+      currentTurn = 'w'; 
+      
+      buildBoardUI();
+      renderBoard();
+      updateTurnLabel();
+
+      if (gameMode === 'ai' && mySide === 'cat') {
+        setTimeout(makeAiMove, 600);
+      }
+    }
+
+    function buildBoardUI() {
+      const boardElement = document.getElementById('chessboard');
+      boardElement.innerHTML = "";
+
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          const file = String.fromCharCode(97 + c); 
+          const rank = 8 - r; 
+          const tileId = `${file}${rank}`;
+          
+          const isDark = (r + c) % 2 === 1;
+          const tileClass = isDark ? "tile-dark" : "tile-light";
+          
+          const tileMarkup = `
+            <div id="tile-${tileId}" 
+                 onclick="onTileClick('${tileId}')" 
+                 class="${tileClass} relative flex justify-center items-center cursor-pointer transition duration-150 select-none aspect-square">
+                 ${c === 0 ? `<span class="absolute left-1 top-0.5 text-[9px] font-sans opacity-40 font-bold">${rank}</span>` : ""}
+                 ${r === 7 ? `<span class="absolute right-1 bottom-0.5 text-[9px] font-sans opacity-40 font-bold">${file.toUpperCase()}</span>` : ""}
+                 <div class="piece-container w-[90%] h-[90%] flex items-center justify-center"></div>
+            </div>
+          `;
+          boardElement.innerHTML += tileMarkup;
+        }
+      }
+    }
+
+    function renderBoard() {
+      const tiles = document.querySelectorAll('.board-grid > div');
+      tiles.forEach(tile => {
+        tile.querySelector('.piece-container').innerHTML = "";
+        tile.classList.remove('tile-selected', 'tile-highlight', 'tile-capture-highlight', 'tile-check');
+      });
+
+      const board = chess.board();
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          const piece = board[r][c];
+          if (piece) {
+            const file = String.fromCharCode(97 + c);
+            const rank = 8 - r;
+            const tileId = `${file}${rank}`;
+            const tileDiv = document.getElementById(`tile-${tileId}`);
+            
+            const key = piece.color + piece.type.toUpperCase(); 
+            if (PIECE_SVGs[key]) {
+              tileDiv.querySelector('.piece-container').innerHTML = PIECE_SVGs[key];
+            }
+          }
+        }
+      }
+
+      if (chess.in_check()) {
+        const kingColor = chess.turn(); 
+        for (let r = 0; r < 8; r++) {
+          for (let c = 0; c < 8; c++) {
+            const piece = board[r][c];
+            if (piece && piece.type === 'k' && piece.color === kingColor) {
+              const file = String.fromCharCode(97 + c);
+              const rank = 8 - r;
+              document.getElementById(`tile-${file}${rank}`).classList.add('tile-check');
+            }
+          }
+        }
+      }
+
+      updateCapturedPieces();
+    }
+
+    function updateTurnLabel() {
+      const label = document.getElementById('game-status-label');
+      const isDogTurn = chess.turn() === 'w';
+      
+      if (isDogTurn) {
+        document.getElementById('card-white-player').classList.add('ring-4', 'ring-amber-400');
+        document.getElementById('card-black-player').classList.remove('ring-4', 'ring-purple-200');
+        label.innerHTML = `🐶 สลับตา: ทีมสุนัขเดิน`;
+        label.className = "bg-amber-100 text-amber-900 py-3 px-4 rounded-2xl text-lg font-bold mb-4 shadow-inner flex items-center justify-center gap-2";
+      } else {
+        document.getElementById('card-black-player').classList.add('ring-4', 'ring-purple-400');
+        document.getElementById('card-white-player').classList.remove('ring-4', 'ring-amber-200');
+        label.innerHTML = `🐱 สลับตา: ทีมแมวเดิน`;
+        label.className = "bg-purple-100 text-purple-900 py-3 px-4 rounded-2xl text-lg font-bold mb-4 shadow-inner flex items-center justify-center gap-2";
+      }
+
+      if (gameMode === 'online') {
+        const isMyTurn = (mySide === 'dog' && isDogTurn) || (mySide === 'cat' && !isDogTurn);
+        if (isMyTurn) {
+          label.innerHTML += ` <span class="bg-emerald-500 text-white text-xs px-2 py-0.5 rounded-md ml-1 animate-pulse">ตาของคุณแล้ว!</span>`;
+        } else {
+          label.innerHTML += ` <span class="bg-gray-400 text-white text-xs px-2 py-0.5 rounded-md ml-1">รอฝั่งตรงข้ามขยับ...</span>`;
+        }
+      }
+    }
+
+    function onTileClick(tileId) {
+      if (chess.game_over()) return;
+
+      if (gameMode === 'online') {
+        const isDogTurn = chess.turn() === 'w';
+        const isMyTurn = (mySide === 'dog' && isDogTurn) || (mySide === 'cat' && !isDogTurn);
+        if (!isMyTurn) return;
+      }
+
+      if (gameMode === 'ai') {
+        const isDogTurn = chess.turn() === 'w';
+        const isMyTurn = (mySide === 'dog' && isDogTurn) || (mySide === 'cat' && !isDogTurn);
+        if (!isMyTurn) return;
+      }
+
+      const highlightTiles = document.querySelectorAll('.tile-highlight, .tile-capture-highlight');
+      highlightTiles.forEach(t => t.classList.remove('tile-highlight', 'tile-capture-highlight'));
+
+      const piece = chess.get(tileId);
+
+      if (selectedTileId === tileId) {
+        selectedTileId = null;
+        renderBoard();
+        return;
+      }
+
+      if (selectedTileId) {
+        const moves = chess.moves({ square: selectedTileId, verbose: true });
+        const validMove = moves.find(m => m.to === tileId);
+
+        if (validMove) {
+          const moveDetails = {
+            from: selectedTileId,
+            to: tileId
+          };
+
+          // เลื่อนขั้นอัตโนมัติเป็นควีน
+          if (validMove.flags.includes('p')) {
+            moveDetails.promotion = 'q'; 
+          }
+
+          chess.move(moveDetails);
+          selectedTileId = null;
+          renderBoard();
+          updateTurnLabel();
+
+          if (gameMode === 'online') {
+            pushOnlineBoardState();
+          }
+
+          const isOver = checkGameStatus();
+
+          if (!isOver && gameMode === 'ai') {
+            setTimeout(makeAiMove, 600);
+          }
+          return;
+        }
+      }
+
+      if (piece && piece.color === chess.turn()) {
+        selectedTileId = tileId;
+        renderBoard();
+        
+        document.getElementById(`tile-${tileId}`).classList.add('tile-selected');
+
+        const moves = chess.moves({ square: tileId, verbose: true });
+        moves.forEach(m => {
+          const targetTile = document.getElementById(`tile-${m.to}`);
+          if (m.captured) {
+            targetTile.classList.add('tile-capture-highlight');
+          } else {
+            targetTile.classList.add('tile-highlight');
+          }
+        });
+      } else {
+        selectedTileId = null;
+        renderBoard();
+      }
+    }
+
+    function updateCapturedPieces() {
+      const initialCounts = {
+        'p': 8, 'r': 2, 'n': 2, 'b': 2, 'q': 1
+      };
+
+      const currentCounts = {
+        'w': { 'p': 0, 'r': 0, 'n': 0, 'b': 0, 'q': 0 },
+        'b': { 'p': 0, 'r': 0, 'n': 0, 'b': 0, 'q': 0 }
+      };
+
+      const board = chess.board();
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          const piece = board[r][c];
+          if (piece && piece.type !== 'k') {
+            currentCounts[piece.color][piece.type]++;
+          }
+        }
+      }
+
+      const containerBlack = document.getElementById('captured-by-black'); 
+      const containerWhite = document.getElementById('captured-by-white'); 
+      
+      containerBlack.innerHTML = "";
+      containerWhite.innerHTML = "";
+
+      for (const [type, count] of Object.entries(initialCounts)) {
+        const lost = count - currentCounts['w'][type];
+        for (let i = 0; i < lost; i++) {
+          containerBlack.innerHTML += `<div class="w-5 h-5 opacity-70">${PIECE_SVGs['w' + type.toUpperCase()]}</div>`;
+        }
+      }
+
+      for (const [type, count] of Object.entries(initialCounts)) {
+        const lost = count - currentCounts['b'][type];
+        for (let i = 0; i < lost; i++) {
+          containerWhite.innerHTML += `<div class="w-5 h-5 opacity-70">${PIECE_SVGs['b' + type.toUpperCase()]}</div>`;
+        }
+      }
+    }
+
+    function checkGameStatus() {
+      if (chess.game_over()) {
+        let goTitle = "เสมอกัน!";
+        let goMsg = "เกมจบลงแบบไม่มีฝ่ายใดเอาชนะกันได้ (Stalemate / Draw)";
+        let goIcon = "🤝";
+        let isWin = false;
+        let isLose = false;
+
+        if (chess.in_checkmate()) {
+          const loserColor = chess.turn(); 
+          const dogWon = loserColor === 'b';
+          
+          if (gameMode === 'local') {
+            goTitle = dogWon ? "🐶 ทีมสุนัขมีชัย!" : "🐱 ทีมแมวมีชัย!";
+            goMsg = dogWon ? "สุนัขทำสำเร็จ เช็กเมตแมวจนมุม!" : "แมวว่องไว เช็กเมตสุนัขจนมุม!";
+            goIcon = "🏆";
+          } else if (gameMode === 'ai') {
+            const playerWon = (mySide === 'dog' && dogWon) || (mySide === 'cat' && !dogWon);
+            goTitle = playerWon ? "🎉 คุณชนะบอท!" : "😢 คุณพ่ายแพ้!";
+            goMsg = playerWon ? "คุณเก่งมาก เอาชนะสมองกลอัจฉริยะได้สำเร็จ!" : "อย่าท้อใจ บอทวางแผนล้ำลึกมาก ลองใหม่อีกครั้ง";
+            goIcon = playerWon ? "🏆" : "🤖";
+            
+            isWin = playerWon;
+            isLose = !playerWon;
+          } else if (gameMode === 'online') {
+            const playerWon = (mySide === 'dog' && dogWon) || (mySide === 'cat' && !dogWon);
+            goTitle = playerWon ? "🏆 ชัยชนะอันยิ่งใหญ่!" : "💥 ตกเป็นผู้พ่ายแพ้";
+            goMsg = playerWon ? "คุณเฉือนชนะคู่แข่งออนไลน์อย่างงดงาม!" : "คู่แข่งขยับหมากได้ล้ำลึกกว่าตาเดินนี้";
+            goIcon = playerWon ? "👑" : "💀";
+            
+            isWin = playerWon;
+            isLose = !playerWon;
+          }
+        }
+
+        openGameOverModal(goTitle, goMsg, goIcon);
+        
+        if (APPS_SCRIPT_URL && myUsername && (gameMode === 'ai' || gameMode === 'online')) {
+          document.getElementById('score-submit-box').classList.remove('hidden');
+          document.getElementById('submit-sheet-btn').disabled = false;
+          document.getElementById('submit-sheet-btn').className = "w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2 px-4 rounded-xl transition text-xs flex justify-center items-center gap-2";
+          document.getElementById('submit-sheet-btn').innerHTML = `<i class="fa-solid fa-cloud-arrow-up"></i> ส่งผลคะแนนขึ้นฐานข้อมูล Google Sheets`;
+          
+          window.lastMatchResult = isWin ? "win" : isLose ? "lose" : "draw";
+        } else {
+          document.getElementById('score-submit-box').classList.add('hidden');
+        }
+
+        stopOnlinePolling();
+        return true;
+      }
+      return false;
+    }
+
+    function submitResultToSheet() {
+      if (!APPS_SCRIPT_URL || !myUsername || !window.lastMatchResult) return;
+
+      const btn = document.getElementById('submit-sheet-btn');
+      btn.disabled = true;
+      btn.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> กำลังอัปเดตข้อมูลขึ้น Cloud Sheet...`;
+
+      const payload = {
+        action: "saveScore",
+        username: myUsername,
+        result: window.lastMatchResult
+      };
+
+      fetch(APPS_SCRIPT_URL, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      })
+      .then(res => res.json())
+      .then(res => {
+        if (res.success) {
+          btn.className = "w-full bg-gray-400 text-gray-100 font-bold py-2 px-4 rounded-xl text-xs cursor-not-allowed";
+          btn.innerHTML = `<i class="fa-solid fa-circle-check"></i> อัปเดตข้อมูลสำเร็จ เรียงลำดับเรียบร้อยแล้ว`;
+          fetchLeaderboard(); 
+        } else {
+          btn.disabled = false;
+          btn.className = "w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-xl transition text-xs";
+          btn.innerHTML = `ล้มเหลว ลองตรวจสอบการ Deploy`;
+        }
+      })
+      .catch(err => {
+        btn.disabled = false;
+        btn.className = "w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-xl transition text-xs";
+        btn.innerHTML = `การเชื่อมต่อขาดหาย ลองส่งใหม่`;
+      });
+    }
+
+    function retryCurrentGame() {
+      closeGameOverModal();
+      initChessboardGame();
+    }
+
+    function resetLocalGame() {
+      if (confirm("คุณแน่ใจหรือไม่ว่าต้องการเริ่มต้นจัดวางหมากใหม่?")) {
+        initChessboardGame();
+      }
+    }
+
+    function leaveCurrentGame() {
+      if (gameMode === 'online' && onlineRoomId) {
+        const payload = { action: "leaveLobby", roomId: onlineRoomId, username: myUsername };
+        fetch(APPS_SCRIPT_URL, { method: "POST", body: JSON.stringify(payload) })
+          .catch(e => console.warn("ถอนตัวล้มเหลว"));
+      }
+      backToMenu();
+    }
+
+
+    // ==================== สมองกลคอมพิวเตอร์ AI (Minimax Engine) ====================
+
+    const positionalValues = {
+      p: [
+        [0,  0,  0,  0,  0,  0,  0,  0],
+        [50, 50, 50, 50, 50, 50, 50, 50],
+        [10, 10, 20, 30, 30, 20, 10, 10],
+        [5,  5, 10, 25, 25, 10,  5,  5],
+        [0,  0,  0, 20, 20,  0,  0,  0],
+        [5, -5,-10,  0,  0,-10, -5,  5],
+        [5, 10, 10,-20,-20, 10, 10,  5],
+        [0,  0,  0,  0,  0,  0,  0,  0]
+      ],
+      n: [
+        [-50,-40,-30,-30,-30,-30,-40,-50],
+        [-40,-20,  0,  0,  0,  0,-20,-40],
+        [-30,  0, 10, 15, 15, 10,  0,-30],
+        [-30,  5, 15, 20, 20, 15,  5,-30],
+        [-30,  0, 15, 20, 20, 15,  0,-30],
+        [-30,  5, 10, 15, 15, 10,  5,-30],
+        [-40,-20,  0,  5,  5,  0,-20,-40],
+        [-50,-40,-30,-30,-30,-30,-40,-50]
+      ],
+      b: [
+        [-20,-10,-10,-10,-10,-10,-10,-20],
+        [-10,  0,  0,  0,  0,  0,  0,-10],
+        [-10,  0,  5, 10, 10,  5,  0,-10],
+        [-10,  5,  5, 10, 10,  5,  5,-10],
+        [-10,  0, 10, 10, 10, 10,  0,-10],
+        [-10, 10, 10, 10, 10, 10, 10,-10],
+        [-10,  5,  0,  0,  0,  0,  5,-10],
+        [-20,-10,-10,-10,-10,-10,-10,-20]
+      ],
+      r: [
+        [0,  0,  0,  0,  0,  0,  0,  0],
+        [5, 10, 10, 10, 10, 10, 10,  5],
+        [-5,  0,  0,  0,  0,  0,  0, -5],
+        [-5,  0,  0,  0,  0,  0,  0, -5],
+        [-5,  0,  0,  0,  0,  0,  0, -5],
+        [-5,  0,  0,  0,  0,  0,  0, -5],
+        [-5,  0,  0,  0,  0,  0,  0, -5],
+        [0,  0,  0,  5,  5,  0,  0,  0]
+      ],
+      q: [
+        [-20,-10,-10, -5, -5,-10,-10,-20],
+        [-10,  0,  0,  0,  0,  0,  0,-10],
+        [-10,  0,  5,  5,  5,  5,  0,-10],
+        [-5,  0,  5,  5,  5,  5,  0, -5],
+        [0,  0,  5,  5,  5,  5,  0, -5],
+        [-10,  5,  5,  5,  5,  5,  0,-10],
+        [-10,  0,  5,  0,  0,  5,  0,-10],
+        [-20,-10,-10, -5, -5,-10,-10,-20]
+      ],
+      k: [
+        [-30,-40,-40,-50,-50,-40,-40,-30],
+        [-30,-40,-40,-50,-50,-40,-40,-30],
+        [-30,-40,-40,-50,-50,-40,-40,-30],
+        [-30,-40,-40,-50,-50,-40,-40,-30],
+        [-20,-30,-30,-40,-40,-30,-30,-20],
+        [-10,-20,-20,-20,-20,-20,-20,-10],
+        [20, 20,  0,  0,  0,  0, 20, 20],
+        [20, 30, 10,  0,  0, 10, 30, 20]
+      ]
+    };
+
+    const pieceWeights = { p: 100, n: 320, b: 330, r: 500, q: 900, k: 20000 };
+
+    function makeAiMove() {
+      if (chess.game_over()) return;
+
+      const moves = chess.moves();
+      if (moves.length === 0) return;
+
+      let chosenMove = null;
+
+      if (aiDifficulty === 1) {
+        // ระดับง่าย: สุ่มหมากขยับ
+        chosenMove = moves[Math.floor(Math.random() * moves.length)];
+      } else {
+        // ระดับสองและสาม: เดินโดยอาศัยอัลกอริทึม Minimax และจัดความลึกในการสืบหาล่วงหน้า
+        const depth = aiDifficulty === 2 ? 2 : 3; 
+        chosenMove = getBestMoveUsingMinimax(chess, depth);
+      }
+
+      chess.move(chosenMove);
+      renderBoard();
+      updateTurnLabel();
+      checkGameStatus();
+    }
+
+    function getBestMoveUsingMinimax(gameInstance, depth) {
+      const potentialMoves = gameInstance.moves({ verbose: true });
+      let bestValue = -999999;
+      let optimalMoves = [];
+
+      const isBotWhite = aiSide === 'dog'; 
+
+      potentialMoves.forEach(move => {
+        gameInstance.move(move);
+        let value = minimax(gameInstance, depth - 1, -1000000, 1000000, !isBotWhite);
+        gameInstance.undo();
+
+        if (value > bestValue) {
+          bestValue = value;
+          optimalMoves = [move];
+        } else if (value === bestValue) {
+          optimalMoves.push(move);
+        }
+      });
+
+      const finalMove = optimalMoves[Math.floor(Math.random() * optimalMoves.length)];
+      return finalMove ? finalMove.san : null;
+    }
+
+    function minimax(gameInstance, depth, alpha, beta, isMaximizingPlayer) {
+      if (depth === 0 || gameInstance.game_over()) {
+        return evaluateBoard(gameInstance);
+      }
+
+      const moves = gameInstance.moves({ verbose: true });
+
+      if (isMaximizingPlayer) {
+        let maxEval = -999999;
+        for (let i = 0; i < moves.length; i++) {
+          gameInstance.move(moves[i]);
+          let score = minimax(gameInstance, depth - 1, alpha, beta, false);
+          gameInstance.undo();
+          maxEval = Math.max(maxEval, score);
+          alpha = Math.max(alpha, score);
+          if (beta <= alpha) break; 
+        }
+        return maxEval;
+      } else {
+        let minEval = 999999;
+        for (let i = 0; i < moves.length; i++) {
+          gameInstance.move(moves[i]);
+          let score = minimax(gameInstance, depth - 1, alpha, beta, true);
+          gameInstance.undo();
+          minEval = Math.min(minEval, score);
+          beta = Math.min(beta, score);
+          if (beta <= alpha) break; 
+        }
+        return minEval;
+      }
+    }
+
+    function evaluateBoard(gameInstance) {
+      let score = 0;
+      const board = gameInstance.board();
+
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          const piece = board[r][c];
+          if (piece) {
+            let pVal = pieceWeights[piece.type];
+            
+            if (piece.type === 'p') pVal += positionalValues.p[r][c];
+            else if (piece.type === 'n') pVal += positionalValues.n[r][c];
+            else if (piece.type === 'b') pVal += positionalValues.b[r][c];
+            else if (piece.type === 'r') pVal += positionalValues.r[r][c];
+            else if (piece.type === 'q') pVal += positionalValues.q[r][c];
+            else if (piece.type === 'k') pVal += positionalValues.k[r][c];
+
+            if (piece.color === (aiSide === 'dog' ? 'w' : 'b')) {
+              score += pVal;
+            } else {
+              score -= pVal;
+            }
+          }
+        }
+      }
+      return score;
+    }
+  </script>
+</body>
+</html>
